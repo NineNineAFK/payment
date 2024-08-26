@@ -1,14 +1,19 @@
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
-const bodyParser = require('body-parser');
+const nodemailer = require("nodemailer");
+const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const URL = process.env.URL; 
+const URL = process.env.URL;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const PRODUCT_ID = process.env.PRODUCT_ID
+const PRODUCT_ID_1 = process.env.PRODUCT_ID_1;
+const PRODUCT_ID_2 = process.env.PRODUCT_ID_2;
 const app = express();
-//app.use(bodyParser.json()); // since we are using webhooks it requires data to be sent and received in raw binary format.
-                            // therefore we use express.raw(), scroll down. it sents data in raw format. get it fat u fat fuck?
+
+// Middleware to parse URL-encoded data from forms
+app.use(express.urlencoded({ extended: true }));
+console.log('Product ID 1:', PRODUCT_ID_1);
+console.log('Product ID 2:', PRODUCT_ID_2);
 
 const BUY_HTML = `
   <!DOCTYPE html>
@@ -16,9 +21,9 @@ const BUY_HTML = `
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+    <title>Shop</title>
     <style>
-      input[type="submit"] {
+      input[type="submit"], button {
         height: 40px;
         width: 200px;
         border: none;
@@ -28,119 +33,405 @@ const BUY_HTML = `
         font-size: 16px;
         font-weight: bold;
         cursor: pointer;
+        margin-top: 10px;
+      }
+      .product {
+        margin-bottom: 20px;
       }
     </style>
   </head>
   <body>
-    <form action="${URL}/create-checkout-session" method="POST">
-      <input type="submit" value="Buy WittCepter $10" />
-    </form>
+    <div class="product">
+      <h2>Product 1 - $10</h2>
+      <form action="/add-to-cart" method="POST">
+        <input type="hidden" name="productName" value="WittCepter Product 1">
+        <input type="hidden" name="priceId" value="${PRODUCT_ID_1}">
+        <input type="submit" value="Add to Cart">
+      </form>
+    </div>
+    <div class="product">
+      <h2>Product 2 - $20</h2>
+      <form action="/add-to-cart" method="POST">
+        <input type="hidden" name="productName" value="WittCepter Product 2">
+        <input type="hidden" name="priceId" value="${PRODUCT_ID_2}">
+        <input type="submit" value="Add to Cart">
+      </form>
+    </div>
+    <button onclick="location.href='/cart'">Visit Cart</button>
   </body>
   </html>`;
 
+app.get("/", (req, res) => {
+  res.send(BUY_HTML);
+});
 
-app.get("/",(req, res)=>{
-    res.send(BUY_HTML);
-})
 // MongoDB Connection
 mongoose.connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
+  useNewUrlParser: true,
+  useUnifiedTopology: true
 }).then(() => console.log('MongoDB connected'))
   .catch(err => console.log('MongoDB connection error:', err));
 
-// Order Model
+
+// order schema
 const Order = mongoose.model('Order', new mongoose.Schema({
-    productId: { type: String,  },
-    productName: { type: String,  },
-    amount: { type: Number,  },
-    currency: { type: String,  },
-    status: { type: String,  },
-    paymentIntentId: { type: String },
-    customerEmail: { type: String,  },
-    customerName: { type: String,  },
-    paymentMethodTypes: { type: [String],  },
-    purchasedAt: { type: Date, default: Date.now } 
-}));
-
-// Stripe Checkout Endpoint
-app.post('/create-checkout-session', async (req, res) => {
-//    const { productId } = req.body;
-
-    try {
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-                price: PRODUCT_ID, // Stripe Price ID
-                quantity: 1
-            }],
-            mode: 'payment',
-            success_url: `${URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${URL}/cancel`
-        });
-        //res.redirect(303,session.url)
-        res.json({ id: session.id, url:session.url });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+  checkoutSessionId: { type: String, required: true },
+  productId: { type: String,  },
+  productName: { type: String,  },
+  amount: { type: Number,  },
+  currency: { type: String,  },
+  status: { type: String,  },
+  paymentIntentId: { type: String },
+  customerEmail: { type: String,  },
+  customerName: { type: String,  },
+  paymentMethodTypes: { type: [String],  },
+  purchasedAt: { type: Date, default: Date.now },
+  purchasedProducts: [
+    {
+        productId: { type: String, required: true },
+        productName: { type: String, required: true }
     }
+  ],
+  licenseKeys: [
+    {
+      productName: String,
+      licenseKey: String,
+    }
+  ]  
+}));  
+
+// Cart Schema
+const cartSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  items: [{
+    productName: { type: String, required: true },
+    priceId: { type: String, required: true },
+    quantity: { type: Number, required: true, default: 1 }
+  }],
+  totalAmount: { type: Number, required: true, default: 0 },
 });
 
-// Stripe Webhook for Payment Confirmation and db logging after confirming events cuh
+const Cart = mongoose.model('Cart', cartSchema);
+
+// Add to Cart Route
+app.post('/add-to-cart', async (req, res) => {
+  const { productName, priceId } = req.body;
+
+  let cart = await Cart.findOne({ userId: "default_user" });
+
+  if (!cart) {
+    cart = new Cart({ userId: "default_user", items: [], totalAmount: 0 });
+  }
+
+  const itemIndex = cart.items.findIndex(item => item.productName === productName);
+
+  if (itemIndex > -1) {
+    cart.items[itemIndex].quantity += 1;
+  } else {
+    cart.items.push({ productName, priceId });
+  }
+
+  await cart.save();
+  res.redirect('/');
+});
+
+// View Cart Route
+app.get('/cart', async (req, res) => {
+  const cart = await Cart.findOne({ userId: "default_user" });
+
+  if (!cart || cart.items.length === 0) {
+    return res.send('<h1>Your cart is empty.</h1>');
+  }
+
+  let cartHTML = `<h1>Your Cart</h1><ul>`;
+  cart.items.forEach(item => {
+    cartHTML += `
+      <li>${item.productName} - x ${item.quantity}
+        <form action="/cart/decrease" method="POST" style="display:inline;">
+          <input type="hidden" name="productName" value="${item.productName}">
+          <button type="submit">-</button>
+        </form>
+        <form action="/cart/increase" method="POST" style="display:inline;">
+          <input type="hidden" name="productName" value="${item.productName}">
+          <button type="submit">+</button>
+        </form>
+      </li>`;
+  });
+  cartHTML += `</ul>`;
+  cartHTML += `<form action="/checkout" method="POST"><input type="submit" value="Buy Now"></form>`;
+
+  res.send(cartHTML);
+});
+
+// Route to increase quantity
+app.post('/cart/increase', async (req, res) => {
+  const { productName } = req.body;
+
+  let cart = await Cart.findOne({ userId: "default_user" });
+
+  if (cart) {
+    const itemIndex = cart.items.findIndex(item => item.productName === productName);
+
+    if (itemIndex > -1) {
+      cart.items[itemIndex].quantity += 1;
+      await cart.save();
+    }
+  }
+
+  res.redirect('/cart');
+});
+
+// Route to decrease quantity
+app.post('/cart/decrease', async (req, res) => {
+  const { productName } = req.body;
+
+  let cart = await Cart.findOne({ userId: "default_user" });
+
+  if (cart) {
+    const itemIndex = cart.items.findIndex(item => item.productName === productName);
+
+    if (itemIndex > -1) {
+      if (cart.items[itemIndex].quantity > 1) {
+        cart.items[itemIndex].quantity -= 1;
+      } else {
+        cart.items.splice(itemIndex, 1); // Remove item if quantity is less than 1
+      }
+      await cart.save();
+    }
+  }
+
+  res.redirect('/cart');
+});
+
+// Checkout Route
+app.post('/checkout', async (req, res) => {
+  try {
+    const cart = await Cart.findOne({ userId: "default_user" });
+
+    if (!cart || cart.items.length === 0) {
+      return res.send('<h1>Your cart is empty.</h1>');
+    }
+
+    const lineItems = cart.items.map(item => ({
+      price: item.priceId,
+      quantity: item.quantity
+    }));
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: lineItems,
+      mode: 'payment',
+      success_url: `${URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${URL}/cancel`
+    });
+
+    res.redirect(session.url);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stripe Webhook for Payment Confirmation and db logging after confirming events
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    
-    try {
-        const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-        
-        if (event.type === 'checkout.session.completed') {
-            const session = event.data.object;
+  const sig = req.headers['stripe-signature'];
 
-            // fetching session details cuh
-            const sessionDetails = await stripe.checkout.sessions.retrieve(session.id);
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
 
-            console.log('Checkout session completed!', sessionDetails);
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
 
-            //  data from the session details cuh
-            const order = new Order({
-                productId: session.id,
-                productName: session.metadata.productName, // Access the product name from metadata (nahi ho raha )
-                amount: session.amount_total,
-                currency: session.currency,
-                status: session.payment_status,
-                paymentIntentId: session.payment_intent,
-                customerEmail: session.customer_details.email, 
-                customerName: session.customer_details.name,   
-                paymentMethodTypes: session.payment_method_types, 
-                purchasedAt: new Date()  // Automatically 
-              });
+            // Fetching session details
+            const sessionDetails = await stripe.checkout.sessions.retrieve(session.id, {
+              expand: ['line_items']
+          });
 
-            await order.save();
-            console.log('Order saved:', order);
-
+          const purchasedProducts = sessionDetails.line_items.data.map(item => ({
+              productId: item.price.id,
+              productName: item.description
+          }));
+  // Loop through purchased products and generate a license key for each
+  const licenseKeys = await Promise.all(
+    purchasedProducts.map(async product => {
+        // Customize the API call based on the product
+        let mask;
+        if (product.productName === 'Basic Utility') {
+            mask = 'BASIC-****-*****-****-****';
+        } else if (product.productName === 'Premium utility') {
+            mask = 'ADVANCED-****-*****-****-****';
         } else {
-            console.log('Unhandled event type:', event.type);
+            throw new Error('Unknown product');
         }
 
-        res.sendStatus(200);
-    } catch (err) {
-        console.error('Error handling webhook event:', err.message);
-        res.sendStatus(400);
+        const keyAuthResponse = await axios.get('https://keyauth.win/api/seller/', {
+            params: {
+                sellerkey: '41c53e856284893fe769ebad06c0bdd4',
+                type: 'add',
+                format: 'json',
+                expiry: 10,
+                mask: mask,  // Using the specific mask for each product
+                amount: 1,
+                owner: 'Xsd9awYPQD',
+                character: 2,
+                note: `Generated for ${product.productName}`
+            }
+        });
+
+        // Assuming the license key is in keyAuthResponse.data.key
+        const licenseKey = keyAuthResponse.data.key; // Adjust based on actual response structure
+        console.log(licenseKey);
+        return { productName: product.productName, licenseKey };
+    })
+);
+      
+
+   
+
+        // Send the license keys to the user's email
+      await sendLicenseKeyEmail(session.customer_details.email, licenseKeys);
+
+
+
+         //Saving order details to the database damn she thiccS
+         const order = new Order({
+          checkoutSessionId: session.id, 
+          productId: session.id,
+          productName: session.metadata.productName, // Access the product name from metadata (if available)
+          amount: session.amount_total,
+          currency: session.currency,
+          status: session.payment_status,
+          paymentIntentId: session.payment_intent,
+          customerEmail: session.customer_details.email,
+          customerName: session.customer_details.name,
+          paymentMethodTypes: session.payment_method_types,
+          purchasedAt: new Date(),
+          purchasedProducts,
+          licenseKeys ,
+          
+        });
+  
+        await order.save();
+        console.log('Order saved:', order);
+
+      // Clear the cart after successful checkout
+      await Cart.findOneAndDelete({ userId: "default_user" });
+
+    } else {
+      console.log('Unhandled event type:', event.type);
     }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('Error handling webhook event:', err.message);
+    res.sendStatus(400);
+  }
 });
 
 
+// Nodemailer setup
+const transporter = nodemailer.createTransport({
+  service: 'Gmail', // or another email service
+  auth: {
+    user: process.env.EMAIL_USER, // Your email address
+    pass: process.env.EMAIL_PASS // Your email password
+  }
+});
 
+// Function to send the license key email
+const sendLicenseKeyEmail = (email, licenseKeys) => {
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: 'Your Product License Keys',
+    html: `
+      <h1>Thank you for your purchase!</h1>
+      <p>Here are your license keys for the products you purchased:</p>
+      <ul>
+        ${licenseKeys.map(key => `<li>${key.productName}: ${key.licenseKey}</li>`).join('')}
+      </ul>
+      <p>Enjoy your products!</p>
+    `
+  };
+
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      console.error('Error sending email:', error);
+    } else {
+      console.log('Email sent:', info.response);
+    }
+  });
+};
 
 
 app.get('/success', async (req, res) => {
-   
-    res.send(`<html><body><h1>Thanks for your order, </h1></body></html>`);
-  });
+  const sessionId = req.query.session_id;
+  console.log(sessionId)
+  if (!sessionId) {
+    
+    return res.send('<h1>No session found</h1>');
+  }
 
-  app.get('/cancel', (req, res) => {
-    res.send('<h1>Cancelled</h1>');
-  });
+  // Find the order using the new `checkoutSessionId` field
+  const order = await Order.findOne({ checkoutSessionId: sessionId });
+  if (!order) {
+    //console.log(checkoutSessionId)
+    return res.send('<h1>No order found</h1>');
+  }
 
+  let downloadLinks = '<h1>Thanks for your order!</h1><h2>Download your products:</h2><ul>';
+  order.purchasedProducts.forEach(product => {
+    // Create a secure download link for each product
+    downloadLinks += `<li><a href="/download/${product.productId}">${product.productName}</a></li>`;
+  });
+  downloadLinks += '</ul>';
+
+  res.send(`<html><body>${downloadLinks}</body></html>`);
+});
+
+
+
+const path = require('path');
+
+// Assuming .exe files are stored in a directory named 'downloads'
+app.get('/download/:productId', async (req, res) => {
+    const { productId } = req.params;
+
+    // Fetch the order to verify if the product was purchased
+    const order = await Order.findOne({ "purchasedProducts.productId": productId });
+
+    if (!order) {
+        return res.status(403).send('Unauthorized access');
+    }
+
+    // Map productId to actual file name or path
+    const productMap = {
+        [PRODUCT_ID_1]: 'product1.exe',
+        [PRODUCT_ID_2]: 'product2.exe'
+    };
+
+    const fileName = productMap[productId];
+    if (!fileName) {
+        return res.status(404).send('Product not found');
+    }
+
+    const filePath = path.join(__dirname, 'downloads', fileName);
+
+    // Serve the file for download
+    res.download(filePath, fileName, err => {
+        if (err) {
+            console.error('File download error:', err);
+            res.status(500).send('Error downloading file');
+        }
+    });
+});
+
+
+app.get('/cancel', (req, res) => {
+  res.send('<h1>Cancelled</h1>');
+});
 
 // Start Server
 app.listen(3000, () => console.log('Server running on port 3000'));
+
+
+
